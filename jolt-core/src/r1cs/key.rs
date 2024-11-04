@@ -171,6 +171,10 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         self.num_cons_total
     }
 
+    pub fn num_vars_uniform(&self) -> usize {
+        self.uniform_r1cs.num_vars
+    }
+
     /// Evaluates A(r_x, y) + r_rlc * B(r_x, y) + r_rlc^2 * C(r_x, y) where r_x = r_constr || r_step for all y.
     #[tracing::instrument(skip_all, name = "UniformSpartanKey::evaluate_r1cs_mle_rlc")]
     pub fn evaluate_r1cs_mle_rlc(&self, r_constr: &[F], r_step: &[F], r_rlc: F) -> Vec<F> {
@@ -183,7 +187,7 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         let eq_rx_step = EqPolynomial::evals(r_step);
         let eq_rx_constr = EqPolynomial::evals(r_constr);
         let first_non_uniform_row = self.uniform_r1cs.num_rows;
-        let constant_column = self.uniform_r1cs.num_vars;
+        let constant_column = self.uniform_r1cs.num_vars.next_power_of_two();
 
         // Computation strategy
         // 1. Compute the RLC of the repeated terms in A, B, C, and the constant column
@@ -192,8 +196,9 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
 
         let compute_repeated =
             |constraints: &SparseConstraints<F>, non_uni_constants: Option<Vec<F>>| -> Vec<F> {
-                // +1 for constant
-                let mut evals = unsafe_allocate_zero_vec(self.uniform_r1cs.num_vars + 1);
+                // evals: [inputs, aux ... 1, ...] where ... indicates padding to next power of 2
+                let mut evals =
+                    unsafe_allocate_zero_vec(self.uniform_r1cs.num_vars.next_power_of_two() * 2);
                 for (row, col, val) in constraints.vars.iter() {
                     evals[*col] += mul_0_1_optimized(val, &eq_rx_constr[*row]);
                 }
@@ -218,13 +223,14 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         let sm_c_r = compute_repeated(&self.uniform_r1cs.c, None);
 
         let r_rlc_sq = r_rlc.square();
-        let sm_rlc = sm_a_r
+        let mut sm_rlc = sm_a_r
             .iter()
             .zip(sm_b_r.iter())
             .zip(sm_c_r.iter())
             .map(|((a, b), c)| *a + mul_0_1_optimized(b, &r_rlc) + mul_0_1_optimized(c, &r_rlc_sq))
             .collect::<Vec<F>>();
 
+        /* Crush: not needed
         let mut rlc = unsafe_allocate_zero_vec(self.num_cols_total());
 
         {
@@ -243,6 +249,7 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         }
 
         rlc[self.num_vars_total()] = sm_rlc[self.uniform_r1cs.num_vars]; // constant
+        */ 
 
         // Handle non-uniform constraints
         let update_non_uni = |rlc: &mut Vec<F>,
@@ -271,12 +278,12 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
             let span = tracing::span!(tracing::Level::INFO, "update_non_uniform");
             let _guard = span.enter();
             for (i, constraint) in self.offset_eq_r1cs.constraints.iter().enumerate() {
-                update_non_uni(&mut rlc, &constraint.eq, i, F::one());
-                update_non_uni(&mut rlc, &constraint.condition, i, r_rlc);
+                update_non_uni(&mut sm_rlc, &constraint.eq, i, F::one());
+                update_non_uni(&mut sm_rlc, &constraint.condition, i, r_rlc);
             }
         }
 
-        rlc
+        sm_rlc
     }
 
     /// Evaluates the full expanded witness vector at 'r' using evaluations of segments.
@@ -298,10 +305,16 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         let eval_variables: F = (0..self.uniform_r1cs.num_vars)
             .map(|var_index| r_var_eq[var_index] * segment_evals[var_index])
             .sum();
-        let const_poly = SparsePolynomial::new(self.num_vars_total().log_2(), vec![(F::one(), 0)]);
-        let eval_const = const_poly.evaluate(r_rest);
 
-        (F::one() - r_const) * eval_variables + r_const * eval_const
+        // Crush: 
+        let var_and_const_bits: usize = var_bits + 1;
+        let eq_consts = EqPolynomial::new(r[..var_and_const_bits].to_vec());
+        let eq_const = eq_consts.evaluate(&index_to_field_bitvector(
+            1 << (var_and_const_bits - 1),
+            var_and_const_bits,
+        ));
+
+        (F::one() - r_const) * eval_variables + eq_const * F::one()
     }
 
     /// Evaluates A(r), B(r), C(r) efficiently using their small uniform representations.
@@ -325,8 +338,12 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         let eq_rx_constr = EqPolynomial::evals(r_row_constr);
         let eq_ry_var = EqPolynomial::evals(r_col_var);
 
-        let constant_column = index_to_field_bitvector(self.num_cols_total() / 2, total_cols_bits);
-        let col_eq_constant = EqPolynomial::new(r_col.to_vec()).evaluate(&constant_column);
+        // Crush: 
+        let constant_column = index_to_field_bitvector(
+            self.num_cols_total() / 2 / self.num_steps,
+            uniform_cols_bits + 1,
+        );
+        let col_eq_constant = EqPolynomial::new(r_col_var.to_vec()).evaluate(&constant_column);
 
         let compute_uniform_matrix_mle = |constraints: &SparseConstraints<F>| -> F {
             let mut full_mle_evaluation: F = constraints
@@ -334,7 +351,9 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
                 .iter()
                 .map(|(row, col, coeff)| *coeff * eq_rx_constr[*row] * eq_ry_var[*col])
                 .sum::<F>()
-                * eq_rx_ry_step;
+                ;
+                // Crush: 
+                // * eq_rx_ry_step;
 
             full_mle_evaluation += constraints
                 .consts
