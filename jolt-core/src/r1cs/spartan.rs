@@ -1,5 +1,6 @@
 #![allow(clippy::len_without_is_empty)]
 
+// use core::range;
 use std::marker::PhantomData;
 
 use crate::field::JoltField;
@@ -22,6 +23,7 @@ use thiserror::Error;
 use crate::{
     poly::{dense_mlpoly::DensePolynomial, eq_poly::EqPolynomial},
     subprotocols::sumcheck::SumcheckInstanceProof,
+    r1cs::special_polys::eq_plus_one,
 };
 
 use super::builder::CombinedUniformBuilder;
@@ -165,6 +167,7 @@ where
             outer_sumcheck_claims[2],
             outer_sumcheck_claims[3],
         );
+
         ProofTranscript::append_scalars(transcript, [claim_Az, claim_Bz, claim_Cz].as_slice());
 
         // inner sum-check
@@ -174,6 +177,7 @@ where
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * claim_Cz;
 
         // Crush:
+        let num_steps_padded = constraint_builder.uniform_repeat().next_power_of_two();
         let num_steps_bits_ = constraint_builder
             .uniform_repeat()
             .next_power_of_two()
@@ -188,14 +192,46 @@ where
         }).flatten().collect();
         z.resize(z.len().next_power_of_two(), F::zero());
 
-        let mut poly_z = DensePolynomial::new(z.clone());
-        for r_s in r_x_step.iter().rev() {
-            poly_z.bound_poly_var_bot(r_s);
-        }
-        let mut evals = poly_z.evals();
-        evals.push(F::one());
+        let is_last_step = EqPolynomial::new(r_x_step.to_vec()).evaluate(&vec![F::one(); r_x_step.len()]);
+        let eq_rx_step = EqPolynomial::evals(r_x_step);
+
+        // // Evals with binding. Doesn't ignore when r_x_step is the last step. 
+        // for r_s in r_x_step.iter().rev() {
+        //     poly_z.bound_poly_var_bot(r_s);
+        // }
+        // let mut evals = poly_z.evals();
+        // evals.push(F::one() - is_last_step); // ARASU: IGNORE LAST STEP? 
+        // evals.resize(evals.len().next_power_of_two() * 1, F::zero());
+
+        // Evals straightfoward
+        let mut evals: Vec<F> = (0..key.num_vars_uniform()) // until the constant (which is not included)
+        .map(|y_var| {
+            (0..(num_steps_padded-1)) // Ignore the last step
+                .map(|t| z[y_var * num_steps_padded + t] * eq_rx_step[t])
+                .sum()
+        })
+        .collect();
         evals.resize(evals.len().next_power_of_two(), F::zero());
-        poly_z = DensePolynomial::new(evals);
+        evals.push(F::one() - is_last_step); // Constant, ignores the last step.  
+        evals.resize(evals.len().next_power_of_two(), F::zero());
+
+        let n_bits_ts = r_x_step.len();
+        let eq_plus_one_rx_step: Vec<F> = (0..num_steps_padded)
+            .map(|t| eq_plus_one(r_x_step, &crate::utils::index_to_field_bitvector(t, n_bits_ts), n_bits_ts))
+            .collect();
+
+        let mut evals_shifted = (0..key.num_vars_uniform())
+            .map(|y_var: usize| {
+                (0..num_steps_padded-1)
+                    .map(|t| 
+                        z[y_var * num_steps_padded + t] * eq_plus_one_rx_step[t] 
+                    )
+                    .sum::<F>()
+            })
+            .collect::<Vec<F>>();
+        evals_shifted.resize(evals.len(), F::zero());
+
+        let poly_z = DensePolynomial::new(evals.into_iter().chain(evals_shifted.into_iter()).collect());
 
         // this is the polynomial extended from the vector r_A * A(r_x, y) + r_B * B(r_x, y) + r_C * C(r_x, y) for all y
         let num_steps_bits = constraint_builder
@@ -207,9 +243,9 @@ where
         let poly_ABC =
             DensePolynomial::new(key.evaluate_r1cs_mle_rlc(rx_con, rx_ts, r_inner_sumcheck_RLC));
         assert_eq!(poly_z.len(), poly_ABC.len());
+        assert_eq!(poly_ABC.len(), key.num_vars_uniform().next_power_of_two() * 4); // *4 to support cross_step constraints
 
-        // Crush: second sumcheck call 
-        let num_rounds = (key.num_vars_uniform() * 2).next_power_of_two().log_2();
+        let num_rounds = poly_ABC.len().log_2();
         let mut polys = vec![poly_ABC, poly_z]; 
         let comb_func = |poly_evals: &[F]| -> F {
             assert_eq!(poly_evals.len(), 2);
@@ -229,7 +265,7 @@ where
         // Crush:
         let r_z = r_x_step; 
 
-        let chi = EqPolynomial::evals(r_z);
+        let chi = EqPolynomial::evals(&r_z);
         let claimed_witness_evals: Vec<_> = flattened_polys
             .par_iter()
             .map(|poly| poly.evaluate_at_chi_low_optimized(&chi))
@@ -310,10 +346,11 @@ where
             + r_inner_sumcheck_RLC * self.outer_sumcheck_claims.1
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * self.outer_sumcheck_claims.2;
 
+
         let num_rounds = (key.num_vars_uniform() * 2).next_power_of_two().log_2();
         let (claim_inner_final, inner_sumcheck_r) = self
             .inner_sumcheck_proof
-            .verify(claim_inner_joint, num_rounds, 2, transcript)
+            .verify(claim_inner_joint, num_rounds, 2, transcript) 
             .map_err(|_| SpartanError::InvalidInnerSumcheckProof)?;
 
         // n_prefix = n_segments + 1
@@ -335,6 +372,10 @@ where
         let right_expected = eval_Z;
         let claim_inner_final_expected = left_expected * right_expected;
 
+        assert_eq!(claim_inner_final, claim_inner_final_expected);
+        println!("claim_inner_final: {:?}", claim_inner_final);
+        println!("claim_inner_final_expected: {:?}", claim_inner_final_expected);
+        assert!(false); 
         if claim_inner_final != claim_inner_final_expected {
             return Err(SpartanError::InvalidInnerSumcheckClaim);
         }
@@ -410,3 +451,93 @@ where
 //             .expect("Spartan verifier failed");
 //     }
 // }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+    use rand_core::{RngCore, CryptoRng};
+    use ark_bn254::Fr as F; // Add this line to import the field type
+    use ark_ff::{Zero, One}; // Import the Zero trait
+
+    #[test]
+    fn test_shifted_polynomial_evaluations() {
+        // Generate a vector z of random field elements of length 128
+        let mut rng = rand::thread_rng();
+        let z: Vec<F> = (0..128).map(|_| F::from(rng.gen::<u64>())).collect();
+
+        // Resize z to the next power of two
+        let mut z_resized = z.clone();
+        z_resized.resize(z.len().next_power_of_two() * 2, F::zero());
+
+        println!("z_resized.len(): {:?}", z_resized.len());
+
+        let r_x_step: Vec<F> = vec![F::zero(), F::zero(), F::one(), F::zero()];
+
+        // Create the polynomial from z
+        let mut poly_z = DensePolynomial::new(z_resized.clone());
+        for r_s in r_x_step.iter().rev() {
+            poly_z.bound_poly_var_bot(r_s);
+        }
+        let evals = poly_z.evals();
+
+        // Create the shifted polynomial from z
+        let mut z_shifted: Vec<F> = z[1..].to_vec();
+        z_shifted.resize(z.len().next_power_of_two(), F::zero());
+
+        let mut poly_z_shifted = DensePolynomial::new(z_shifted.clone());
+        for r_s in r_x_step.iter().rev() {
+            poly_z_shifted.bound_poly_var_bot(r_s);
+        }
+        let evals_shifted = poly_z_shifted.evals();
+
+        // // print the first 10 lines of evals and evals_shifted 
+        // for i in 0..4 {
+        //     println!("z: {:?}", z); 
+        //     println!("evals_shifted: {:?}", evals_shifted); 
+        //     // println!("evals[{}]: {:?}, evals_shifted[{}]: {:?}", i, evals[i], i, evals_shifted[i]);
+        //     println!("z[{}]: {:?}, evals_shifted[{}]: {:?}", i+1, z[i+1], i, evals_shifted[i]);
+        //     // println!("z[{}]: {:?}", i+1, z[i+1]);
+
+        // }
+
+        // print each element of z preceded by index: 
+        for i in 0..z.len() {
+            println!("z[{}]: {:?}", i, z[i]);
+        }
+        println!("evals_shifted: {:?}", evals_shifted); 
+
+
+
+        // // Evaluate the polynomials at a random point k
+        // let k: F = F::random(&mut rng);
+        // let eval_at_k = poly_z.evaluate(&k);
+        // let eval_shifted_at_k_minus_1 = poly_z_shifted.evaluate(&(k - F::one()));
+
+        // // Check if the evaluations are correct
+        // assert_eq!(eval_at_k, eval_shifted_at_k_minus_1);
+    }
+    #[test]
+    fn test_eq_polynomial_evals() {
+        // Generate a random vector of length 8
+        let mut rng = rand::thread_rng();
+        let random_vector: Vec<F> = (0..8).map(|_| F::from(rng.gen::<u64>())).collect();
+
+        // generate all 1s vector of lenght 8 
+        let all_ones_vector: Vec<F> = (0..8).map(|_| F::one()).collect();
+
+        // Run EqPolynomial::evals on the random vector
+        let eq_evals = EqPolynomial::evals(&random_vector);
+        let all_ones_evals = EqPolynomial::evals(&all_ones_vector);
+
+        // // Print the random vector and its evaluations
+        // for i in 0..random_vector.len() {
+        //     println!("random_vector[{}]: {:?}", i, random_vector[i]);
+        // }
+        // println!("eq_evals: {:?}", eq_evals);
+        println!("all_ones_evals.last(): {:?}", all_ones_evals[2]);
+
+        // // Check if the evaluations are correct (this is a placeholder, you should replace it with actual checks)
+        // assert_eq!(eq_evals.len(), random_vector.len().next_power_of_two());
+    }
+}

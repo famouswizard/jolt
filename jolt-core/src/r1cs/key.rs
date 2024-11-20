@@ -1,3 +1,4 @@
+// use std::{f128::consts::E, marker::PhantomData};
 use std::marker::PhantomData;
 
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
@@ -184,7 +185,6 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         );
         assert_eq!(r_step.len(), self.num_steps.log_2());
 
-        let eq_rx_step = EqPolynomial::evals(r_step);
         let eq_rx_constr = EqPolynomial::evals(r_constr);
         let first_non_uniform_row = self.uniform_r1cs.num_rows;
         let constant_column = self.uniform_r1cs.num_vars.next_power_of_two();
@@ -198,7 +198,7 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
             |constraints: &SparseConstraints<F>, non_uni_constants: Option<Vec<F>>| -> Vec<F> {
                 // evals: [inputs, aux ... 1, ...] where ... indicates padding to next power of 2
                 let mut evals =
-                    unsafe_allocate_zero_vec(self.uniform_r1cs.num_vars.next_power_of_two() * 2);
+                    unsafe_allocate_zero_vec(self.uniform_r1cs.num_vars.next_power_of_two() * 4); // *4 to accommodate cross-step constraints 
                 for (row, col, val) in constraints.vars.iter() {
                     evals[*col] += mul_0_1_optimized(val, &eq_rx_constr[*row]);
                 }
@@ -209,6 +209,8 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
 
                 if let Some(non_uni_constants) = non_uni_constants {
                     for (i, non_uni_constant) in non_uni_constants.iter().enumerate() {
+                        // The matrix values are present even in the last step. 
+                        // It's the role of the evaluation of the z mle to ignore the last step. 
                         evals[constant_column] +=
                             eq_rx_constr[first_non_uniform_row + i] * non_uni_constant;
                     }
@@ -258,19 +260,12 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
                               r: F| {
             for (col, is_offset, coeff) in offset.offset_vars.iter() {
                 let offset = if *is_offset { 1 } else { 0 };
+                let col = *col + offset * constant_column * 2; 
 
-                // Ignores the offset overflow at the last step
-                let y_index_range = *col * self.num_steps + offset..(*col + 1) * self.num_steps;
-                let steps = (0..self.num_steps).into_par_iter();
-
-                rlc[y_index_range]
-                    .par_iter_mut()
-                    .zip(steps)
-                    .for_each(|(rlc_col, step_index)| {
-                        *rlc_col += mul_0_1_optimized(&r, coeff)
-                            * eq_rx_step[step_index]
-                            * eq_rx_constr[first_non_uniform_row + non_uni_constraint_index];
-                    });
+                // The matrix values are present even in the last step. 
+                // It's the role of the evaluation of the z mle to ignore the last step. 
+                rlc[col] += mul_0_1_optimized(&r, coeff)
+                    * eq_rx_constr[first_non_uniform_row + non_uni_constraint_index];
             }
         };
 
@@ -505,39 +500,39 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
 //         );
 //     }
 
-//     #[test]
-//     fn evaluate_r1cs_mle_rlc() {
-//         let (_builder, key) = simp_test_builder_key();
-//         let (a, b, c) = simp_test_big_matrices();
-//         let a = DensePolynomial::new(a);
-//         let b = DensePolynomial::new(b);
-//         let c = DensePolynomial::new(c);
+    // #[test]
+    // fn evaluate_r1cs_mle_rlc() {
+    //     let (_builder, key) = simp_test_builder_key();
+    //     let (a, b, c) = simp_test_big_matrices();
+    //     let a = DensePolynomial::new(a);
+    //     let b = DensePolynomial::new(b);
+    //     let c = DensePolynomial::new(c);
 
-//         let r_row_constr_len = (key.uniform_r1cs.num_rows + 1).next_power_of_two().log_2();
-//         let r_col_step_len = key.num_steps.log_2();
+    //     let r_row_constr_len = (key.uniform_r1cs.num_rows + 1).next_power_of_two().log_2();
+    //     let r_col_step_len = key.num_steps.log_2();
 
-//         let r_row_constr = vec![Fr::from(100), Fr::from(200)];
-//         let r_row_step = vec![Fr::from(100), Fr::from(200)];
-//         assert_eq!(r_row_constr.len(), r_row_constr_len);
-//         assert_eq!(r_row_step.len(), r_col_step_len);
-//         let r_rlc = Fr::from(1000);
+    //     let r_row_constr = vec![Fr::from(100), Fr::from(200)];
+    //     let r_row_step = vec![Fr::from(100), Fr::from(200)];
+    //     assert_eq!(r_row_constr.len(), r_row_constr_len);
+    //     assert_eq!(r_row_step.len(), r_col_step_len);
+    //     let r_rlc = Fr::from(1000);
 
-//         let rlc = key.evaluate_r1cs_mle_rlc(&r_row_constr, &r_row_step, r_rlc);
+    //     let rlc = key.evaluate_r1cs_mle_rlc(&r_row_constr, &r_row_step, r_rlc);
 
-//         // let row_coordinate_len = key.num_rows_total().log_2();
-//         let col_coordinate_len = key.num_cols_total().log_2();
-//         let row_coordinate: Vec<Fr> = [r_row_constr, r_row_step].concat();
-//         for i in 0..key.num_cols_total() {
-//             let col_coordinate = index_to_field_bitvector(i, col_coordinate_len);
+    //     // let row_coordinate_len = key.num_rows_total().log_2();
+    //     let col_coordinate_len = key.num_cols_total().log_2();
+    //     let row_coordinate: Vec<Fr> = [r_row_constr, r_row_step].concat();
+    //     for i in 0..key.num_cols_total() {
+    //         let col_coordinate = index_to_field_bitvector(i, col_coordinate_len);
 
-//             let coordinate: Vec<Fr> = [row_coordinate.clone(), col_coordinate].concat();
-//             let expected_rlc = a.evaluate(&coordinate)
-//                 + r_rlc * b.evaluate(&coordinate)
-//                 + r_rlc * r_rlc * c.evaluate(&coordinate);
+    //         let coordinate: Vec<Fr> = [row_coordinate.clone(), col_coordinate].concat();
+    //         let expected_rlc = a.evaluate(&coordinate)
+    //             + r_rlc * b.evaluate(&coordinate)
+    //             + r_rlc * r_rlc * c.evaluate(&coordinate);
 
-//             assert_eq!(expected_rlc, rlc[i], "Failed at {i}");
-//         }
-//     }
+    //         assert_eq!(expected_rlc, rlc[i], "Failed at {i}");
+    //     }
+    // }
 
 //     #[test]
 //     fn r1cs_matrix_mles_offset_constraints() {
