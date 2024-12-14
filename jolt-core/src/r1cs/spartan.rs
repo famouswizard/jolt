@@ -78,6 +78,8 @@ pub struct UniformSpartanProof<
     pub(crate) outer_sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
     pub(crate) outer_sumcheck_claims: (F, F, F),
     pub(crate) inner_sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
+    pub(crate) shift_sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
+    pub(crate) shift_sumcheck_claim: F,
     pub(crate) claimed_witness_evals: Vec<F>,
     _marker: PhantomData<ProofTranscript>,
 }
@@ -176,13 +178,10 @@ where
             + r_inner_sumcheck_RLC * claim_Bz
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * claim_Cz;
 
-        // Crush:
         let num_steps_padded = constraint_builder.uniform_repeat().next_power_of_two();
-        let num_steps_bits_ = constraint_builder
-            .uniform_repeat()
-            .next_power_of_two()
-            .ilog2() as usize;
-        let num_constraints_bits = key.num_cons_total.log_2() - num_steps_bits_;
+        let num_steps_bits = num_steps_padded.ilog2() as usize;
+        let num_constraints_bits = key.num_cons_total.log_2() - num_steps_bits;
+        
         let r_x_step = &outer_sumcheck_r[num_constraints_bits..];
 
         let mut z: Vec<F> = flattened_polys.clone().into_iter().map(|poly| {
@@ -215,14 +214,13 @@ where
         evals.push(F::one() - is_last_step); // Constant, ignores the last step.  
         evals.resize(evals.len().next_power_of_two(), F::zero());
 
-        let n_bits_ts = r_x_step.len();
         let eq_plus_one_rx_step: Vec<F> = (0..num_steps_padded)
-            .map(|t| eq_plus_one(r_x_step, &crate::utils::index_to_field_bitvector(t, n_bits_ts), n_bits_ts))
+            .map(|t| eq_plus_one(r_x_step, &crate::utils::index_to_field_bitvector(t, num_steps_bits), num_steps_bits))
             .collect();
 
         let mut evals_shifted = (0..key.num_vars_uniform())
             .map(|y_var: usize| {
-                (0..num_steps_padded-1)
+                (0..num_steps_padded-1) // Ignore the last step
                     .map(|t| 
                         z[y_var * num_steps_padded + t] * eq_plus_one_rx_step[t] 
                     )
@@ -234,10 +232,6 @@ where
         let poly_z = DensePolynomial::new(evals.into_iter().chain(evals_shifted.into_iter()).collect());
 
         // this is the polynomial extended from the vector r_A * A(r_x, y) + r_B * B(r_x, y) + r_C * C(r_x, y) for all y
-        let num_steps_bits = constraint_builder
-            .uniform_repeat()
-            .next_power_of_two()
-            .ilog2();
         let (rx_con, rx_ts) =
             outer_sumcheck_r.split_at(outer_sumcheck_r.len() - num_steps_bits as usize);
         let poly_ABC =
@@ -262,8 +256,39 @@ where
         
         drop_in_background_thread(polys);
 
-        // Crush:
         let r_z = r_x_step; 
+
+        let r_y_var = inner_sumcheck_r[1..].to_vec();
+        assert_eq!(r_y_var.len(), key.num_vars_uniform().next_power_of_two().log_2() + 1);
+
+        // Third sumcheck: the shift sumcheck
+        let mut poly_z2 = DensePolynomial::new(
+            z.clone().into_iter().chain(vec![F::zero(); z.len()].into_iter()).collect()
+        );
+        for r_s in r_y_var.iter() {
+            poly_z2.bound_poly_var_top(r_s);
+        }
+        let evals_z_r_y_var= poly_z2.evals(); 
+
+        let num_rounds_shift_sumcheck = num_steps_bits; 
+        let mut shift_sumcheck_polys = vec![DensePolynomial::new(evals_z_r_y_var), DensePolynomial::new(eq_plus_one_rx_step.clone())];
+
+        let shift_sumcheck_claim = (0..((1 << num_rounds_shift_sumcheck) - 1))
+            .map(|i| {
+                let params: Vec<F> = shift_sumcheck_polys.iter().map(|poly| poly[i]).collect();
+                comb_func(&params)
+            })
+            .fold(F::zero(), |acc, x| acc + x);
+
+        let (shift_sumcheck_proof, _, _) =
+            SumcheckInstanceProof::prove_arbitrary(
+                &shift_sumcheck_claim, 
+                num_rounds_shift_sumcheck, 
+                &mut shift_sumcheck_polys, 
+                comb_func, 
+                2, 
+                transcript);
+        drop_in_background_thread(shift_sumcheck_polys);
 
         let chi = EqPolynomial::evals(&r_z);
         let claimed_witness_evals: Vec<_> = flattened_polys
@@ -290,6 +315,8 @@ where
             outer_sumcheck_proof,
             outer_sumcheck_claims,
             inner_sumcheck_proof,
+            shift_sumcheck_proof,
+            shift_sumcheck_claim,
             claimed_witness_evals,
             _marker: PhantomData,
         })
@@ -346,45 +373,48 @@ where
             + r_inner_sumcheck_RLC * self.outer_sumcheck_claims.1
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * self.outer_sumcheck_claims.2;
 
-
-        let num_rounds = (key.num_vars_uniform() * 2).next_power_of_two().log_2();
+        let num_rounds = (key.num_vars_uniform() * 2).next_power_of_two().log_2() + 1; // +1 for cross-step
         let (claim_inner_final, inner_sumcheck_r) = self
             .inner_sumcheck_proof
             .verify(claim_inner_joint, num_rounds, 2, transcript) 
             .map_err(|_| SpartanError::InvalidInnerSumcheckProof)?;
 
-        // n_prefix = n_segments + 1
-        let n_prefix = key.uniform_r1cs.num_vars.next_power_of_two().log_2() + 1;
-
-        // Crush: 
         let n_constraint_bits_uniform = key.uniform_r1cs.num_rows.next_power_of_two().log_2();
         let outer_sumcheck_r_step = &r_x[n_constraint_bits_uniform..];
-        let y_prime = [inner_sumcheck_r.to_owned(), outer_sumcheck_r_step.to_owned()].concat();
+
+        let r_choice = inner_sumcheck_r[0]; 
+        let r_y_var = inner_sumcheck_r[1..].to_vec();
+        let y_prime = [r_y_var, outer_sumcheck_r_step.to_owned()].concat();
         let eval_Z = key.evaluate_z_mle(&self.claimed_witness_evals, &y_prime);
 
-        // Crush: 
         let r = [r_x.clone(), y_prime].concat();
-        let (eval_a, eval_b, eval_c) = key.evaluate_r1cs_matrix_mles(&r);
+        let (eval_a, eval_b, eval_c) = key.evaluate_r1cs_matrix_mles(&r, &r_choice);
 
         let left_expected = eval_a
             + r_inner_sumcheck_RLC * eval_b
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * eval_c;
-        let right_expected = eval_Z;
+        let right_expected = 
+            (F::one() - r_choice) * eval_Z + 
+            r_choice * self.shift_sumcheck_claim; 
         let claim_inner_final_expected = left_expected * right_expected;
 
         assert_eq!(claim_inner_final, claim_inner_final_expected);
-        println!("claim_inner_final: {:?}", claim_inner_final);
-        println!("claim_inner_final_expected: {:?}", claim_inner_final_expected);
-        assert!(false); 
         if claim_inner_final != claim_inner_final_expected {
             return Err(SpartanError::InvalidInnerSumcheckClaim);
         }
+
+        let num_steps_bits = outer_sumcheck_r_step.len();
+        let num_rounds_shift_sumcheck = num_steps_bits;
+        let (claim_shift_final, shift_sumcheck_r) = self
+            .shift_sumcheck_proof
+            .verify(self.shift_sumcheck_claim, num_rounds_shift_sumcheck, 2, transcript) 
+            .map_err(|_| SpartanError::InvalidInnerSumcheckProof)?;
 
         let flattened_commitments: Vec<_> = I::flatten::<C>()
             .iter()
             .map(|var| var.get_ref(commitments))
             .collect();
-        // Crush: 
+
         let r_y_point = &r_x[n_constraint_bits_uniform..];
         opening_accumulator.append(
             &flattened_commitments,

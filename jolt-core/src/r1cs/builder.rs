@@ -165,6 +165,16 @@ impl<F: JoltField> AuxComputation<F> {
                 });
             });
 
+        /* Hack(arasuarun): Set all variables in the last step to 0.
+           Needed for the crush-second-sumcheck optimization. 
+           There should be a better way to do this instead of iterating over all witness segments. 
+        */
+        let mut last_index = batch_size - 1;
+        while last_index < aux_poly.len() {
+            aux_poly[last_index] = F::zero();
+            last_index += batch_size;
+        }
+
         DensePolynomial::new(aux_poly)
     }
 
