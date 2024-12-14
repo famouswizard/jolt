@@ -262,7 +262,7 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
 
     /// Evaluates the full expanded witness vector at 'r' using evaluations of segments.
     #[tracing::instrument(skip_all, name = "UniformSpartanKey::evaluate_z_mle")]
-    pub fn evaluate_z_mle(&self, segment_evals: &[F], r: &[F]) -> F {
+    pub fn evaluate_z_mle(&self, segment_evals: &[F], r: &[F], with_const: bool) -> F {
         assert_eq!(self.uniform_r1cs.num_vars, segment_evals.len());
         assert_eq!(r.len(), self.full_z_len().log_2()); 
 
@@ -285,12 +285,13 @@ impl<const C: usize, F: JoltField, I: ConstraintInput> UniformSpartanKey<C, I, F
         // If r_const = 1, only the constant position (with all other index bits are 0) has a non-zero value
         let var_and_const_bits: usize = var_bits + 1;
         let eq_consts = EqPolynomial::new(r[..var_and_const_bits].to_vec());
-        let eq_const = eq_consts.evaluate(&index_to_field_bitvector(
+        let mut eq_const = eq_consts.evaluate(&index_to_field_bitvector(
             1 << (var_and_const_bits - 1),
             var_and_const_bits,
         ));
+        let const_coeff = if with_const { F::one() } else { F::zero() };
 
-        ((F::one() - r_const) * eval_variables) + eq_const * F::one() * (F::one() - eq_last_step)
+        ((F::one() - r_const) * eval_variables) + eq_const * const_coeff * (F::one() - eq_last_step)
     }
 
     /// Evaluates A(r), B(r), C(r) efficiently using their small uniform representations.

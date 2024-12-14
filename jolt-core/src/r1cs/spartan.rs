@@ -81,6 +81,7 @@ pub struct UniformSpartanProof<
     pub(crate) shift_sumcheck_proof: SumcheckInstanceProof<F, ProofTranscript>,
     pub(crate) shift_sumcheck_claim: F,
     pub(crate) claimed_witness_evals: Vec<F>,
+    pub(crate) claimed_witness_evals_shift_sumcheck: Vec<F>,
     _marker: PhantomData<ProofTranscript>,
 }
 
@@ -280,7 +281,7 @@ where
             })
             .fold(F::zero(), |acc, x| acc + x);
 
-        let (shift_sumcheck_proof, _, _) =
+        let (shift_sumcheck_proof, shift_sumcheck_r, shift_sumcheck_claims) =
             SumcheckInstanceProof::prove_arbitrary(
                 &shift_sumcheck_claim, 
                 num_rounds_shift_sumcheck, 
@@ -304,6 +305,21 @@ where
             transcript,
         );
 
+        // Polynomial evals for shift sumcheck
+        let chi2 = EqPolynomial::evals(&shift_sumcheck_r);
+        let claimed_witness_evals_shift_sumcheck: Vec<_> = flattened_polys
+            .par_iter()
+            .map(|poly| poly.evaluate_at_chi_low_optimized(&chi2))
+            .collect();
+
+        opening_accumulator.append(
+            &flattened_polys,
+            DensePolynomial::new(chi2),
+            shift_sumcheck_r.to_vec(),
+            &claimed_witness_evals_shift_sumcheck.iter().collect::<Vec<_>>(),
+            transcript,
+        );
+
         // Outer sumcheck claims: [eq(r_x), A(r_x), B(r_x), C(r_x)]
         let outer_sumcheck_claims = (
             outer_sumcheck_claims[1],
@@ -318,6 +334,7 @@ where
             shift_sumcheck_proof,
             shift_sumcheck_claim,
             claimed_witness_evals,
+            claimed_witness_evals_shift_sumcheck,
             _marker: PhantomData,
         })
     }
@@ -384,8 +401,8 @@ where
 
         let r_choice = inner_sumcheck_r[0]; 
         let r_y_var = inner_sumcheck_r[1..].to_vec();
-        let y_prime = [r_y_var, outer_sumcheck_r_step.to_owned()].concat();
-        let eval_Z = key.evaluate_z_mle(&self.claimed_witness_evals, &y_prime);
+        let y_prime = [r_y_var.clone(), outer_sumcheck_r_step.to_owned()].concat();
+        let eval_z = key.evaluate_z_mle(&self.claimed_witness_evals, &y_prime, true);
 
         let r = [r_x.clone(), y_prime].concat();
         let (eval_a, eval_b, eval_c) = key.evaluate_r1cs_matrix_mles(&r, &r_choice);
@@ -394,7 +411,7 @@ where
             + r_inner_sumcheck_RLC * eval_b
             + r_inner_sumcheck_RLC * r_inner_sumcheck_RLC * eval_c;
         let right_expected = 
-            (F::one() - r_choice) * eval_Z + 
+            (F::one() - r_choice) * eval_z + 
             r_choice * self.shift_sumcheck_claim; 
         let claim_inner_final_expected = left_expected * right_expected;
 
@@ -410,6 +427,15 @@ where
             .verify(self.shift_sumcheck_claim, num_rounds_shift_sumcheck, 2, transcript) 
             .map_err(|_| SpartanError::InvalidInnerSumcheckProof)?;
 
+        let y_prime_shift_sumcheck = [r_y_var, shift_sumcheck_r.to_owned()].concat(); 
+        let eval_z_shift_sumcheck = key.evaluate_z_mle(&self.claimed_witness_evals_shift_sumcheck, &y_prime_shift_sumcheck, false);
+        let eq_plus_one_shift_sumcheck = eq_plus_one(&outer_sumcheck_r_step, &shift_sumcheck_r, num_steps_bits);
+        let claim_shift_sumcheck_expected = eval_z_shift_sumcheck * eq_plus_one_shift_sumcheck; 
+        assert_eq!(claim_shift_final, claim_shift_sumcheck_expected);
+        if claim_shift_final != claim_shift_sumcheck_expected {
+            return Err(SpartanError::InvalidInnerSumcheckClaim);
+        }
+
         let flattened_commitments: Vec<_> = I::flatten::<C>()
             .iter()
             .map(|var| var.get_ref(commitments))
@@ -420,6 +446,13 @@ where
             &flattened_commitments,
             r_y_point.to_vec(),
             &self.claimed_witness_evals.iter().collect::<Vec<_>>(),
+            transcript,
+        );
+
+        opening_accumulator.append(
+            &flattened_commitments,
+            shift_sumcheck_r.to_vec(),
+            &self.claimed_witness_evals_shift_sumcheck.iter().collect::<Vec<_>>(),
             transcript,
         );
 
